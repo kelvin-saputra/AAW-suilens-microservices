@@ -5,4 +5,4 @@ COPY package.json pnpm-lock.yaml* ./
 RUN pnpm install --frozen-lockfile || pnpm install
 COPY . .
 EXPOSE 5173
-CMD ["pnpm", "run", "dev", "--host", "0.0.0.0", "--port", "5173"]
+CMD ["sh", "-c", "pnpm", "run", "build", "&&", "pnpm", "run", "preview"]
