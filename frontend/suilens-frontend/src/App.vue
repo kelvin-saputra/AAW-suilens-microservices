@@ -10,14 +10,13 @@
     <v-main class="bg-grey-lighten-4">
       <v-container>
         <v-row>
-          <!-- Catalog Section -->
           <v-col cols="12" md="7" lg="8">
             <h2 class="text-h4 font-weight-bold mb-4 text-primary">Available Lenses</h2>
-            
+
             <div v-if="loadingLenses" class="d-flex justify-center my-8">
               <v-progress-circular indeterminate color="primary" size="64"></v-progress-circular>
             </div>
-            
+
             <v-alert
               v-else-if="lenses.length === 0"
               type="info"
@@ -37,13 +36,36 @@
                   <v-card-subtitle class="text-body-1 font-weight-medium text-high-emphasis">
                     {{ lens.modelName }}
                   </v-card-subtitle>
-                  
+
                   <v-card-text class="flex-grow-1">
                     <div class="text-h5 text-primary font-weight-bold mt-2">
                       ${{ lens.dayPrice }} <span class="text-body-2 text-disabled">/day</span>
                     </div>
+
+                    <div class="mt-4">
+                      <div class="text-subtitle-2 mb-1">Stock Availability:</div>
+                      <v-list density="compact" class="pa-0">
+                        <v-list-item v-if="lens.inventoryLoading" class="px-0">
+                           <v-progress-circular indeterminate size="20" color="primary"></v-progress-circular>
+                        </v-list-item>
+                        <v-list-item v-else-if="!lens.inventory || lens.inventory.length === 0" class="px-0">
+                          <v-chip size="small" color="error">Out of Stock</v-chip>
+                        </v-list-item>
+                        <v-list-item
+                          v-else
+                          v-for="inv in lens.inventory"
+                          :key="inv.branchCode"
+                          class="px-0 min-h-0"
+                          style="min-height: 24px"
+                        >
+                          <span class="text-caption">
+                            {{ inv.availableQuantity }} unit(s) in {{ inv.branchName }}
+                          </span>
+                        </v-list-item>
+                      </v-list>
+                    </div>
                   </v-card-text>
-                  
+
                   <v-divider></v-divider>
                   <v-card-actions class="pa-3">
                     <v-btn
@@ -52,8 +74,9 @@
                       block
                       prepend-icon="mdi-cart-plus"
                       @click="selectLens(lens)"
+                      :disabled="!hasStock(lens)"
                     >
-                      Select
+                      {{ hasStock(lens) ? 'Select' : 'Unavailable' }}
                     </v-btn>
                   </v-card-actions>
                 </v-card>
@@ -75,18 +98,30 @@
                         </template>
 
                         <v-list-item-title class="font-weight-bold">
-                          {{ order.lensSnapshot.modelName }}
+                          {{ order.lensSnapshot.modelName }} | {{ getBranchName(order.branchCode) }}
                         </v-list-item-title>
                         <v-list-item-subtitle>
                           {{ order.customerName }} ({{ order.customerEmail }})
                         </v-list-item-subtitle>
-                        
+
                         <template v-slot:append>
-                          <div class="text-right">
+                          <div class="text-right d-flex flex-column align-end">
                             <div class="text-h6 text-success font-weight-bold">${{ order.totalPrice }}</div>
-                            <v-chip size="small" :color="order.status === 'confirmed' ? 'success' : 'warning'">
-                              {{ order.status || 'pending' }}
-                            </v-chip>
+                            <div class="d-flex align-center mt-1">
+                              <v-chip size="small" :color="order.status === 'confirmed' ? 'success' : order.status === 'cancelled' ? 'error' : 'warning'" class="mr-2">
+                                {{ order.status || 'pending' }}
+                              </v-chip>
+                              <v-btn
+                                v-if="order.status !== 'cancelled'"
+                                size="x-small"
+                                color="error"
+                                variant="outlined"
+                                :loading="cancelingOrderId === order.id"
+                                @click="cancelOrder(order.id)"
+                              >
+                                Cancel
+                              </v-btn>
+                            </div>
                           </div>
                         </template>
                       </v-list-item>
@@ -140,6 +175,20 @@
                 </div>
 
                 <v-form ref="orderForm" @submit.prevent="submitOrder">
+                  <v-select
+                    v-if="selectedLens"
+                    v-model="form.branchCode"
+                    :items="getAvailableBranches(selectedLens)"
+                    item-title="title"
+                    item-value="value"
+                    label="Select Branch"
+                    prepend-inner-icon="mdi-store"
+                    variant="outlined"
+                    density="comfortable"
+                    required
+                    :rules="[v => !!v || 'Branch is required']"
+                  ></v-select>
+
                   <v-text-field
                     v-model="form.customerName"
                     label="Full Name"
@@ -227,7 +276,11 @@ import { ref, onMounted } from 'vue';
 const CATALOG_API = import.meta.env.VITE_CATALOG_API || 'http://localhost:3001';
 const ORDER_API = import.meta.env.VITE_ORDER_API || 'http://localhost:3002';
 
+import { useInventory } from './composables/useInventory';
+
 const lenses = ref([]);
+const { branches, hasStock, getAvailableBranches, fetchInventoryForAllLenses } = useInventory();
+
 const orders = ref([]);
 const loadingLenses = ref(false);
 const submitting = ref(false);
@@ -235,10 +288,12 @@ const selectedLens = ref(null);
 const orderMessage = ref('');
 const orderStatus = ref('success');
 const orderForm = ref(null);
+const cancelingOrderId = ref(null);
 
 const form = ref({
   customerName: '',
   customerEmail: '',
+  branchCode: '',
   startDate: '',
   endDate: ''
 });
@@ -248,7 +303,11 @@ const fetchLenses = async () => {
   try {
     const res = await fetch(`${CATALOG_API}/api/lenses`);
     if (res.ok) {
-      lenses.value = await res.json();
+      const data = await res.json();
+      lenses.value = data.map(lens => ({ ...lens, inventoryLoading: true, inventory: [] }));
+
+      // Fetch inventory concurrently using composable
+      await fetchInventoryForAllLenses(lenses.value);
     } else {
       console.error('Failed to fetch lenses');
     }
@@ -270,8 +329,14 @@ const fetchOrders = async () => {
   }
 };
 
+const getBranchName = (code) => {
+  const branch = branches.value.find(b => b.code === code);
+  return branch ? branch.name : code;
+};
+
 const selectLens = (lens) => {
   selectedLens.value = lens;
+  form.value.branchCode = ''; // Reset branch selection when lens changes
   orderMessage.value = '';
 };
 
@@ -281,14 +346,14 @@ const submitOrder = async () => {
     orderStatus.value = 'error';
     return;
   }
-  
+
   if (!orderForm.value) return;
   const { valid } = await orderForm.value.validate();
   if (!valid) return;
-  
+
   submitting.value = true;
   orderMessage.value = '';
-  
+
   try {
     const res = await fetch(`${ORDER_API}/api/orders`, {
       method: 'POST',
@@ -298,18 +363,20 @@ const submitOrder = async () => {
       body: JSON.stringify({
         customerName: form.value.customerName,
         customerEmail: form.value.customerEmail,
+        branchCode: form.value.branchCode,
         startDate: form.value.startDate,
         endDate: form.value.endDate,
         lensId: selectedLens.value.id
       })
     });
-    
+
     if (res.ok) {
       orderMessage.value = 'Order placed successfully!';
       orderStatus.value = 'success';
       form.value = {
         customerName: '',
         customerEmail: '',
+        branchCode: '',
         startDate: '',
         endDate: ''
       };
@@ -327,6 +394,36 @@ const submitOrder = async () => {
     orderStatus.value = 'error';
   } finally {
     submitting.value = false;
+  }
+};
+
+const cancelOrder = async (orderId) => {
+  if (!confirm('Are you sure you want to cancel this order?')) return;
+
+  cancelingOrderId.value = orderId;
+  orderMessage.value = '';
+
+  try {
+    const res = await fetch(`${ORDER_API}/api/orders/${orderId}/cancel`, {
+      method: 'PATCH'
+    });
+
+    if (res.ok) {
+      await fetchOrders();
+      await fetchLenses();
+      orderMessage.value = 'Order cancelled successfully.';
+      orderStatus.value = 'success';
+    } else {
+      const errorData = await res.json();
+      orderMessage.value = `Failed to cancel order: ${errorData.error || 'Unknown error'}`;
+      orderStatus.value = 'error';
+    }
+  } catch (err) {
+    console.error('Error cancelling order:', err);
+    orderMessage.value = 'Network error while cancelling order.';
+    orderStatus.value = 'error';
+  } finally {
+    cancelingOrderId.value = null;
   }
 };
 

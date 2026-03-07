@@ -6,6 +6,7 @@ import { eq } from 'drizzle-orm';
 import { publishEvent } from './events';
 
 const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://localhost:3001';
+const INVENTORY_SERVICE_URL = process.env.INVENTORY_SERVICE_URL || 'http://localhost:3003';
 
 interface CatalogLens {
   id: string;
@@ -32,12 +33,35 @@ const app = new Elysia()
         { status: 400 }
       );
     }
+
+    const orderId = crypto.randomUUID();
+
+    const reserveResponse = await fetch(`${INVENTORY_SERVICE_URL}/api/inventory/reserve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        orderId: orderId,
+        branchCode: body.branchCode,
+        lensId: body.lensId,
+        quantity: 1,
+      }),
+    });
+
+    if (!reserveResponse.ok) {
+      const errData = await reserveResponse.json().catch(() => null) as { error?: string } | null;
+      return new Response(
+        JSON.stringify({ error: errData?.error || 'Failed to reserve inventory for the selected branch' }),
+        { status: reserveResponse.status }
+      );
+    }
     const totalPrice = (days * parseFloat(lens.dayPrice)).toFixed(2);
 
     const [order] = await db.insert(orders).values({
+      id: orderId,
       customerName: body.customerName,
       customerEmail: body.customerEmail,
       lensId: body.lensId,
+      branchCode: body.branchCode,
       lensSnapshot: {
         modelName: lens.modelName,
         manufacturerName: lens.manufacturerName,
@@ -56,6 +80,7 @@ const app = new Elysia()
       customerName: body.customerName,
       customerEmail: body.customerEmail,
       lensName: lens.modelName,
+      branchCode: body.branchCode,
     });
 
     return new Response(JSON.stringify(order), { status: 201 });
@@ -64,6 +89,7 @@ const app = new Elysia()
       customerName: t.String(),
       customerEmail: t.String({ format: 'email' }),
       lensId: t.String({ format: 'uuid' }),
+      branchCode: t.String(),
       startDate: t.String(),
       endDate: t.String(),
     }),
@@ -75,6 +101,36 @@ const app = new Elysia()
       return new Response(JSON.stringify({ error: 'Order not found' }), { status: 404 });
     }
     return results[0];
+  })
+  .patch('/api/orders/:id/cancel', async ({ params }) => {
+    const results = await db.select().from(orders).where(eq(orders.id, params.id));
+    if (!results[0]) {
+      return new Response(JSON.stringify({ error: 'Order not found' }), { status: 404 });
+    }
+    const order = results[0];
+
+    if (order.status === 'cancelled') {
+      return new Response(JSON.stringify({ error: 'Order is already cancelled' }), { status: 400 });
+    }
+
+    const [updatedOrder] = await db
+      .update(orders)
+      .set({ status: 'cancelled' })
+      .where(eq(orders.id, params.id))
+      .returning();
+
+    if (!updatedOrder) {
+      return new Response(JSON.stringify({ error: 'Failed to cancel order' }), { status: 500 });
+    }
+
+    await publishEvent('order.cancelled', {
+      orderId: updatedOrder.id,
+      lensId: updatedOrder.lensId,
+      branchCode: updatedOrder.branchCode,
+      quantity: 1
+    });
+
+    return new Response(JSON.stringify(updatedOrder), { status: 200 });
   })
   .get('/health', () => ({ status: 'ok', service: 'order-service' }))
   .listen(3002);
